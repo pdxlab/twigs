@@ -5,7 +5,9 @@ Supports: ping, models, config, evaluate, list-evaluations, get-result.
 """
 
 import sys
+import os
 import time
+import base64
 import logging
 
 from . import utils
@@ -570,6 +572,51 @@ def _build_asset_or_exit(result, args):
         utils.tw_exit(1)
 
 
+def _write_report(result, args):
+    """Write the evaluation report to --output_dir, when both are available.
+
+    The flag has been accepted and ignored since the mode was added. A failure
+    here is reported but not fatal: the asset is the primary output of a run that
+    has already consumed credits, and losing it because a file could not be
+    written would be the worse outcome.
+    """
+    output_dir = getattr(args, "output_dir", None)
+    if not output_dir:
+        return None
+
+    eval_id = getattr(result, "id", "unknown")
+    # getattr, not attribute access: an older SDK may not carry report_base64.
+    report_base64 = getattr(result, "report_base64", None)
+    if not report_base64:
+        logging.warning(
+            "No report available for evaluation %s; nothing written to %s.",
+            eval_id,
+            output_dir,
+        )
+        return None
+
+    try:
+        report = base64.b64decode(report_base64)
+    except Exception as e:
+        logging.warning("Could not decode the report for evaluation %s: %s", eval_id, str(e))
+        return None
+
+    # The server prefers HTML and falls back to PDF, so detect rather than assume.
+    extension = "pdf" if report[:4] == b"%PDF" else "html"
+    path = os.path.join(output_dir, "trustmodel_evaluation_%s.%s" % (eval_id, extension))
+    try:
+        if not os.path.isdir(output_dir):
+            os.makedirs(output_dir)
+        with open(path, "wb") as f:
+            f.write(report)
+    except (OSError, IOError) as e:
+        logging.warning("Could not write the report to %s: %s", path, str(e))
+        return None
+
+    print("Report written to %s" % path)
+    return path
+
+
 def get_inventory(args):
     """Entry point called by twigs dispatcher."""
     if getattr(args, "ping", False):
@@ -581,12 +628,14 @@ def get_inventory(args):
     elif getattr(args, "evaluate", False):
         result = _cmd_evaluate(args)
         if result:
+            _write_report(result, args)
             return [_build_asset_or_exit(result, args)]
     elif getattr(args, "list_evaluations", False):
         _cmd_list_evaluations(args)
     elif getattr(args, "get_result", False):
         result = _cmd_get_result(args)
         if result:
+            _write_report(result, args)
             return [_build_asset_or_exit(result, args)]
 
     return []

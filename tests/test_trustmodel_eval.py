@@ -13,6 +13,10 @@ expose only the attributes each test needs.
 """
 
 import argparse
+import base64
+import os
+import shutil
+import tempfile
 import unittest
 from unittest import mock
 
@@ -448,6 +452,124 @@ class BuildAssetTestCase(unittest.TestCase):
             FakeResult("completed"), make_args(assetname="my-model")
         )
         self.assertEqual(asset["name"], "my-model")
+
+
+class WriteReportTestCase(unittest.TestCase):
+    """--output_dir was accepted and silently ignored until now (§5)."""
+
+    def setUp(self):
+        self.output_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.output_dir, True)
+
+    def write(self, report, output_dir=None, eval_id=7):
+        encoded = base64.b64encode(report).decode("ascii") if report is not None else None
+        result = FakeResult("completed", id=eval_id, report_base64=encoded)
+        args = make_args(
+            output_dir=self.output_dir if output_dir is None else output_dir
+        )
+        return trustmodel_eval._write_report(result, args)
+
+    def test_html_report_is_written(self):
+        path = self.write(b"<html><body>report</body></html>")
+        self.assertTrue(path.endswith("trustmodel_evaluation_7.html"))
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"<html><body>report</body></html>")
+
+    def test_pdf_is_detected_by_magic_bytes(self):
+        """The server prefers HTML and falls back to PDF, so the extension has to
+        follow the bytes rather than an assumption."""
+        path = self.write(b"%PDF-1.7\nbinary")
+        self.assertTrue(path.endswith("trustmodel_evaluation_7.pdf"))
+
+    def test_missing_directory_is_created(self):
+        nested = os.path.join(self.output_dir, "a", "b")
+        path = self.write(b"<html></html>", output_dir=nested)
+        self.assertTrue(os.path.isfile(path))
+
+    def test_absent_report_warns_and_writes_nothing(self):
+        with self.assertLogs(level="WARNING") as captured:
+            self.assertIsNone(self.write(None))
+        self.assertTrue(
+            any("No report available" in r.getMessage() for r in captured.records)
+        )
+        self.assertEqual(os.listdir(self.output_dir), [])
+
+    def test_undecodable_report_warns_and_writes_nothing(self):
+        result = FakeResult("completed", report_base64="not base64 !!!")
+        with self.assertLogs(level="WARNING"):
+            self.assertIsNone(
+                trustmodel_eval._write_report(result, make_args(output_dir=self.output_dir))
+            )
+        self.assertEqual(os.listdir(self.output_dir), [])
+
+    def test_unwritable_directory_warns_rather_than_failing_the_run(self):
+        """The evaluation already cost credits; a bad path must not discard it."""
+        with mock.patch.object(trustmodel_eval.os, "makedirs", side_effect=OSError("denied")):
+            with self.assertLogs(level="WARNING"):
+                self.assertIsNone(
+                    self.write(b"<html></html>", output_dir=os.path.join(self.output_dir, "x"))
+                )
+
+    def test_no_flag_touches_the_filesystem(self):
+        result = FakeResult("completed", report_base64=base64.b64encode(b"x").decode())
+        with mock.patch.object(trustmodel_eval.os, "makedirs") as makedirs:
+            with mock.patch.object(trustmodel_eval, "open", create=True) as opened:
+                self.assertIsNone(trustmodel_eval._write_report(result, make_args()))
+        makedirs.assert_not_called()
+        opened.assert_not_called()
+
+    def test_older_sdk_without_report_base64_degrades_quietly(self):
+        class NoReportField(object):
+            id = 7
+
+        with self.assertLogs(level="WARNING"):
+            self.assertIsNone(
+                trustmodel_eval._write_report(
+                    NoReportField(), make_args(output_dir=self.output_dir)
+                )
+            )
+
+
+class GetInventoryTestCase(unittest.TestCase):
+    """The dispatcher entry point, end to end with the SDK mocked."""
+
+    def setUp(self):
+        self.output_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.output_dir, True)
+
+    def test_get_result_writes_the_report_and_returns_the_asset(self):
+        result = FakeResult(
+            "completed",
+            id=7,
+            vendor_name="openai",
+            model_name="gpt-4",
+            report_base64=base64.b64encode(b"<html>report</html>").decode("ascii"),
+        )
+        client = mock.Mock()
+        client.evaluations.get_result.return_value = result
+        args = make_args(get_result=True, evaluation_id=7, output_dir=self.output_dir)
+
+        with mock.patch.object(trustmodel_eval, "_init_client", return_value=client):
+            assets = trustmodel_eval.get_inventory(args)
+
+        self.assertEqual(len(assets), 1)
+        self.assertEqual(
+            assets[0]["attack_surface_label"], "AI::AI Model::Public::openai::gpt-4"
+        )
+        self.assertEqual(
+            os.listdir(self.output_dir), ["trustmodel_evaluation_7.html"]
+        )
+
+    def test_get_result_without_output_dir_still_returns_the_asset(self):
+        client = mock.Mock()
+        client.evaluations.get_result.return_value = FakeResult("completed", id=7)
+        args = make_args(get_result=True, evaluation_id=7)
+
+        with mock.patch.object(trustmodel_eval, "_init_client", return_value=client):
+            assets = trustmodel_eval.get_inventory(args)
+
+        self.assertEqual(len(assets), 1)
+        self.assertEqual(os.listdir(self.output_dir), [])
 
 
 class BuildAssetGuardTestCase(unittest.TestCase):
