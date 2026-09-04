@@ -23,6 +23,11 @@ from trustmodel.exceptions import (
     TrustModelError,
 )
 
+try:  # trustmodel >= 3.7.0 only. twigs supports >= 3.2, so this may be absent.
+    from trustmodel.exceptions import ResponseParsingError
+except ImportError:  # pragma: no cover - taken on older SDKs
+    ResponseParsingError = None
+
 from twigs import trustmodel_eval
 
 
@@ -222,6 +227,50 @@ class PollErrorClassificationTestCase(PollHarness, unittest.TestCase):
         self.assertTrue(any("pip install -U trustmodel" in m for m in messages))
         self.assertEqual(self.clock.sleeps, [])
 
+    @unittest.skipIf(ResponseParsingError is None, "SDK predates 3.7.0")
+    def test_new_sdk_parse_error_fails_cleanly_without_retrying(self):
+        """The same failure as above, as trustmodel >= 3.7.0 reports it.
+
+        3.7.0 wraps the pydantic error in ResponseParsingError, which IS a
+        TrustModelError - so it is caught by the retry arm rather than the
+        `except Exception` one. It is also an APIError carrying status_code 200,
+        so the 404 test does not mark it fatal. Without an explicit check this
+        deterministic failure is retried for three hours and then misreported as
+        a timeout, which is the hang the status classification exists to prevent.
+        """
+        client = make_client(
+            get_result_side_effect=ResponseParsingError(
+                "Could not parse the API response into EvaluationResult: "
+                "status (enum). This SDK may be out of date.",
+                model_name="EvaluationResult",
+            )
+        )
+        messages = self.assertExits(client)
+        self.assertTrue(any("pip install -U trustmodel" in m for m in messages))
+        self.assertEqual(self.clock.sleeps, [])
+
+    @unittest.skipIf(ResponseParsingError is None, "SDK predates 3.7.0")
+    def test_parse_error_is_an_api_error_with_a_non_404_status(self):
+        """Pins why the fatal-error check alone does not catch it - so that if
+        the SDK ever gives it a real HTTP status, this fails and gets re-thought
+        rather than the guard silently becoming redundant."""
+        error = ResponseParsingError("boom", model_name="EvaluationResult")
+        self.assertIsInstance(error, APIError)
+        self.assertIsInstance(error, TrustModelError)
+        self.assertNotEqual(getattr(error, "status_code", None), 404)
+        self.assertFalse(trustmodel_eval._is_fatal_poll_error(error))
+        self.assertTrue(trustmodel_eval._is_unparseable_result_error(error))
+
+    def test_parse_error_check_degrades_on_an_older_sdk(self):
+        """The class is looked up by name, so an SDK without it reports False
+        and the `except Exception` arm keeps handling the raw pydantic error."""
+        import trustmodel.exceptions as tm_exceptions
+
+        with mock.patch.object(tm_exceptions, "ResponseParsingError", None):
+            self.assertFalse(
+                trustmodel_eval._is_unparseable_result_error(Exception("boom"))
+            )
+
     def test_authentication_error_fails_fast(self):
         client = make_client(get_result_side_effect=AuthenticationError("key revoked"))
         self.assertExits(client)
@@ -286,6 +335,14 @@ class GetResultCommandTestCase(unittest.TestCase):
 
     def test_unparseable_response_fails_cleanly(self):
         messages = self.run_cmd(Exception("1 validation error"))
+        self.assertTrue(any("pip install -U trustmodel" in m for m in messages))
+
+    @unittest.skipIf(ResponseParsingError is None, "SDK predates 3.7.0")
+    def test_new_sdk_parse_error_gets_the_same_message(self):
+        """--get_result must fail identically whichever SDK is installed."""
+        messages = self.run_cmd(
+            ResponseParsingError("bad shape", model_name="EvaluationResult")
+        )
         self.assertTrue(any("pip install -U trustmodel" in m for m in messages))
 
     def test_api_error_still_reports_the_server_message(self):

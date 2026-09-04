@@ -286,6 +286,8 @@ def _cmd_get_result(args):
     try:
         result = client.evaluations.get_result(args.evaluation_id)
     except TrustModelError as e:
+        if _is_unparseable_result_error(e):
+            _exit_on_unparseable_result(args.evaluation_id, e)
         logging.error("Failed to get result: %s", str(e))
         utils.tw_exit(1)
     except Exception as e:
@@ -323,6 +325,26 @@ def _exit_on_unparseable_result(eval_id, e, rerun_hint=False):
         message_args.append(eval_id)
     logging.error(message, *message_args)
     utils.tw_exit(1)
+
+
+def _is_unparseable_result_error(e):
+    """True for the SDK's own wrapper around a response it could not parse.
+
+    trustmodel 3.7.0 converts the pydantic error into ResponseParsingError,
+    which IS a TrustModelError - so on that SDK this failure no longer reaches
+    the `except Exception` arm that catches it on older ones. It is an APIError
+    carrying status_code 200 (the HTTP call succeeded), so the 404 test in
+    _is_fatal_poll_error does not catch it either, and a deterministic parse
+    failure would be retried until the three-hour timeout - the exact hang the
+    status classification above exists to prevent.
+
+    Looked up by name, like the classes below, so an older SDK without it simply
+    reports False and the `except Exception` arm keeps handling the raw error.
+    """
+    import trustmodel.exceptions as tm_exceptions
+
+    klass = getattr(tm_exceptions, "ResponseParsingError", None)
+    return klass is not None and isinstance(e, klass)
 
 
 def _is_fatal_poll_error(e):
@@ -363,6 +385,8 @@ def _poll_and_print_result(client, eval_id, args):
         try:
             result = client.evaluations.get_result(eval_id)
         except TrustModelError as e:
+            if _is_unparseable_result_error(e):
+                _exit_on_unparseable_result(eval_id, e, rerun_hint=True)
             if _is_fatal_poll_error(e):
                 logging.error("Cannot retrieve evaluation %s: %s", eval_id, str(e))
                 utils.tw_exit(1)
